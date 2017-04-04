@@ -1,0 +1,7 @@
+version: '2'
+services:
+  eventstore:
+    image: eventstore/eventstore:release-3.9.3
+    ports:
+      - 1113:1113
+      - 2113:2113
