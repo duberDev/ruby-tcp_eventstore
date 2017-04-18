@@ -4,6 +4,10 @@
 
 Alpha (DO NOT USE IN PRODUCTION)
 
+## License
+
+MIT. See [LICENSE](https://github.com/jdextraze/ruby-tcp_eventstore/blob/master/LICENSE).
+
 ## Requirements
 
 - Docker (docker-compose for test)
