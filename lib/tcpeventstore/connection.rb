@@ -1,5 +1,6 @@
 require 'socket'
 require 'logger'
+require 'concurrent'
 
 module TcpEventStore
   class Connection
@@ -9,28 +10,42 @@ module TcpEventStore
     def initialize(host, port, logger: nil)
       @host = host
       @port = port
-      @mutex = Mutex.new
-      @callbacks = {}
+      @callbacks = Concurrent::Map.new
       if logger.nil?
         @logger = Logger.new(STDOUT)
         @logger.level = Logger::ERROR
       else
         @logger = logger
       end
+      @reconnect = true
+      @writer_queue = Queue.new
+    end
+
+    def connected?
+      !@socket.nil? && !@socket.closed?
+    end
+
+    def reconnect?
+      @reconnect
     end
 
     def connect
-      log(Logger::INFO) { "Connecting to #{@host}:#{@port}" }
+      log(Logger::INFO, "Connecting to #{@host}:#{@port}")
 
       begin
+        return if connected?
         @socket = TCPSocket.new(@host, @port)
-        @connected = true
       rescue => err
-        log(Logger::ERROR) { err.to_s }
+        log(Logger::ERROR, "Error connecting: #{err.to_s}")
       end
 
       reader
-      @socket.nil?
+      writer
+    end
+
+    def close
+      @reconnect = false
+      @socket.close
     end
 
     # @param [String] stream
@@ -55,6 +70,22 @@ module TcpEventStore
       dto.require_master = false
 
       send_command(Data::TcpCommand::WRITE_EVENTS, dto, block)
+    end
+
+    # @param [String] stream
+    # @param [Integer] start
+    # @param [Integer] max
+    # @param [Proc] block
+    # @return [Nil, Protobuf::ReadStreamEventsCompleted]
+    def read_stream_events_backward(stream, start, max, &block)
+      dto = Protobuf::ReadStreamEvents.new
+      dto.event_stream_id = stream
+      dto.from_event_number = start
+      dto.max_count = max
+      dto.resolve_link_tos = false
+      dto.require_master = false
+
+      send_command(Data::TcpCommand::READ_STREAM_EVENTS_BACKWARD, dto, block)
     end
 
     # @param [String] stream
@@ -94,12 +125,13 @@ module TcpEventStore
     # @return [NilClass]
     def unsubscribe_from_stream(correlation_id)
       dto = Protobuf::UnsubscribeFromStream.new
-
-      send_command(Data::TcpCommand::UNSUBSCRIBE_FROM_STREAM, dto, @callbacks[correlation_id], correlation_id)
+      callback = @callbacks[correlation_id]
+      send_command(Data::TcpCommand::UNSUBSCRIBE_FROM_STREAM, dto, callback, correlation_id)
     end
 
     private
 
+    # Thread: called by write thread
     # @param [Fixnum] cmd
     # @param [Object] proto
     # @param [Proc] callback
@@ -112,39 +144,63 @@ module TcpEventStore
       q = nil
       if callback.nil?
         q = Queue.new
-        @callbacks[correlation_id] = lambda { |r| q.push r }
-      else
-        @callbacks[correlation_id] = callback
+        callback = lambda { |r| q.push r }
       end
+      @callbacks[correlation_id] = callback
 
-      send_packet(Data::TcpPacket.new(cmd, 0, correlation_id, nil, nil, proto.to_proto))
+      queue_packet(Data::TcpPacket.new(cmd, 0, correlation_id, nil, nil, proto.to_proto))
 
       return nil if q.nil?
       q.pop
     end
 
+    # Thread: called by connection thread
     def reader
       @reader = Thread.new do
+        log(Logger::INFO, 'Reader thread started')
+
         loop do
           begin
-            data = @socket.recv_nonblock(4096)
+            data = @socket.recv(4096)
             on_data(data)
-          rescue IO::WaitReadable
-            IO::select([@socket], [@socket])
-            retry
           rescue => err
-            log(Logger::INFO) { 'Connection lost: ' + err.to_s }
+            log(Logger::ERROR, "Connection lost: #{err.to_s}")
             break
           end
         end
+        @socket.close rescue nil
 
-        until @connected
+        while !connected? && reconnect?
+          log(Logger::INFO, "Trying to reconnect in 3 seconds | #{connected?}, #{reconnect?}")
           sleep(3)
           connect
         end
+
+        log(Logger::INFO, 'Reader thread ended')
       end
     end
 
+    def writer
+      @writer = Thread.new do
+        log(Logger::INFO, 'Writer thread started')
+
+        loop do
+          begin
+            data = @writer_queue.pop
+            @socket.write(data)
+          rescue => err
+            @writer_queue.push(data)
+            log(Logger::ERROR, "Connection lost #{err.to_s}")
+            break
+          end
+        end
+        @socket.close rescue nil
+
+        log(Logger::INFO, 'Writer thread ended')
+      end
+    end
+
+    # Thread: called by read thread only
     # @param [String] data
     def on_data(data)
       unless @leftover.nil? || @leftover.length == 0
@@ -168,22 +224,26 @@ module TcpEventStore
       end
     end
 
+    # Thread: called by read thread only
     # @param [TcpPacket] packet
     def process(packet)
-      log(Logger::DEBUG) {
-        'Received command: ' + packet.command.to_s +
-            ' | Correlation Id: ' + packet.correlation_id.bytes.to_s
-      }
+      log(Logger::DEBUG,
+          "Received command: #{packet.command.to_s} | Correlation Id: #{packet.correlation_id.bytes.to_s}")
+
+      if packet.command == Data::TcpCommand::HEARTBEAT_REQUEST_COMMAND
+        queue_packet(Data::TcpPacket.new(Data::TcpCommand::HEARTBEAT_RESPONSE_COMMAND, 0, packet.correlation_id, nil, nil, ''))
+        return
+      end
 
       callback = @callbacks[packet.correlation_id]
       case packet.command
-        when Data::TcpCommand::HEARTBEAT_REQUEST_COMMAND then
-          send_packet(Data::TcpPacket.new(Data::TcpCommand::HEARTBEAT_RESPONSE_COMMAND,
-                                    0, packet.correlation_id, nil, nil, ''))
         when Data::TcpCommand::WRITE_EVENTS_COMPLETED then
           callback.call(Protobuf::WriteEventsCompleted.decode(packet.payload))
           @callbacks.delete(packet.correlation_id)
         when Data::TcpCommand::READ_STREAM_EVENTS_FORWARD_COMPLETED then
+          callback.call(Protobuf::ReadStreamEventsCompleted.decode(packet.payload))
+          @callbacks.delete(packet.correlation_id)
+        when Data::TcpCommand::READ_STREAM_EVENTS_BACKWARD_COMPLETED then
           callback.call(Protobuf::ReadStreamEventsCompleted.decode(packet.payload))
           @callbacks.delete(packet.correlation_id)
         when Data::TcpCommand::SUBSCRIPTION_CONFIRMATION then
@@ -197,31 +257,25 @@ module TcpEventStore
           callback.call('BadRequest')
           @callbacks.delete(packet.correlation_id)
         else
-          log(Logger::INFO) { 'Not supported' }
+          log(Logger::INFO, 'Not supported')
       end
     end
 
-    def send_packet(packet)
-      log(Logger::DEBUG) {
-        'Sending command: ' + packet.command.to_s +
-            ' | Correlation Id: ' + packet.correlation_id.bytes.to_s
-      }
+    # Thread: called by both read and write threads
+    # @param [TcpPacket] packet
+    def queue_packet(packet)
+      log(Logger::DEBUG,
+          "Queueing command: #{packet.command.to_s} | Correlation Id: #{packet.correlation_id.bytes.to_s}")
 
-      data = [packet.size].pack('V') + packet.bytes
-      begin
-        @socket.write_nonblock(data)
-      rescue IO::WaitWritable, Errno::EINTR
-        IO.select([@socket], [@socket])
-        retry
-      rescue => err
-        log(Logger::ERROR) { err.to_s }
-      end
+      @writer_queue.push([packet.size].pack('V') + packet.bytes)
     end
 
+    # Thread: called by both read and write threads
     # @param [Fixnum] severity
-    # @param [Proc] block
-    def log(severity, &block)
-      @logger.add(severity, nil, 'TcpEventStore') { block.call }
+    # @param [String|Nil] message
+    def log(severity, message = nil)
+      message = yield if block_given?
+      @logger.add(severity, message, 'TcpEventStore')
     end
   end
 end
